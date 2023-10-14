@@ -1,5 +1,5 @@
 """
-financial_data_loader.py
+financial_data_loader
 
 This module provides classes and functions for loading financial data from the Alpha Vantage API,
 sending it to an SQS queue, and storing it in InfluxDB. It also includes a utility class for initializing
@@ -48,7 +48,7 @@ from influxdb_client.rest import ApiException
 from src.logger import create_logger
 
 # Set up logger
-logger = create_logger("info", "logger")
+logger = create_logger("logger")
 
 class ConnectionInitializer:
     """
@@ -83,13 +83,12 @@ class ConnectionInitializer:
         Returns:
             botocore.client.SQS: Initialized AWS SQS client.
         """
-        sqs_client = boto3.client(
+        return boto3.client(
             'sqs',
             aws_access_key_id=self.aws_access_key,
             aws_secret_access_key=self.aws_secret_key,
-            region_name=self.aws_region
+            region_name=self.aws_region,
         )
-        return sqs_client
 
     def initialize_influxdb_connection(self):
         """
@@ -98,13 +97,10 @@ class ConnectionInitializer:
         Returns:
             influxdb_client.client.write_api.WriteApi: Initialized InfluxDB client.
         """
-        client = influxdb_client.InfluxDBClient(
-            url=self.influxdb_url,
-            token=self.influxdb_token,
-            org=self.influxdb_org
+        logger.info("Initializing InfluxDB client with URL: %s, %s, %s, %s", self.influxdb_url, self.influxdb_bucket, self.influxdb_org, self.influxdb_token)
+        return influxdb_client.InfluxDBClient(
+            url=self.influxdb_url, token=self.influxdb_token, org=self.influxdb_org
         )
-        write_api = client.write_api()
-        return write_api
 
 class FinancialDataLoader:
     """
@@ -121,7 +117,7 @@ class FinancialDataLoader:
         influxdb_client (influxdb_client.client.write_api.WriteApi): Initialized InfluxDB client.
     """
 
-    def __init__(self, sqs_client, influxdb_client):
+    def __init__(self):
         """
         Initializes the FinancialDataLoader with necessary attributes and clients.
 
@@ -138,6 +134,14 @@ class FinancialDataLoader:
         self.sqs_client = sqs_client  # Assign initialized SQS client
         self.influxdb_client = influxdb_client  # Assign initialized InfluxDB client
 
+        logger.info(
+            "API INFO: %s, %s, %s, %s",
+            self.url,
+            self.function,
+            self.symbol,
+            self.interval,
+        )
+
 
     def getDataFromAPI(self) -> requests.Response:
         """
@@ -146,12 +150,14 @@ class FinancialDataLoader:
         Returns:
             requests.Response: Response object containing data from the API.
         """
+        url = f"{self.url}?function={self.function}&symbol={self.symbol}&interval={self.interval}&apikey={self.apikey}"
+        logger.info(f"URL: {url}")
         try:
             payload = {}
             headers = {}
-            response = requests.request("GET", self.url, headers=headers, data=payload)
+            response = requests.request("GET", url=url, headers=headers, data=payload)
             response.raise_for_status()  # Raise an HTTPError for bad responses
-            return response
+            return response._content
         except requests.exceptions.HTTPError as errh:
             logger.exception(f"HTTP Error: {errh}")
         except requests.exceptions.ConnectionError as errc:
@@ -171,23 +177,22 @@ class FinancialDataLoader:
         Returns:
             list: List of dictionaries containing formatted data for InfluxDB insertion.
         """
-        influxdb_data = []
+        data = json.loads(data)
         time_series_data = data.get("Time Series (5min)")
-        for timestamp, values in time_series_data.items():
-            influxdb_point = {
-                "measurement": "stock_prices",
-                "tags": {"symbol": data["Meta Data"]["2. Symbol"]},
-                "time": timestamp,
-                "fields": {
-                    "open": float(values["1. open"]),
-                    "high": float(values["2. high"]),
-                    "low": float(values["3. low"]),
-                    "close": float(values["4. close"]),
-                    "volume": int(values["5. volume"]),
-                },
-            }
-            influxdb_data.append(influxdb_point)
-        return influxdb_data
+        latest_refreshed = data["Meta Data"]["3. Last Refreshed"]
+        ts_data = time_series_data[latest_refreshed]
+        return {
+            "measurement": "stock_prices",
+            "tags": {"symbol": data["Meta Data"]["2. Symbol"]},
+            "time": latest_refreshed,
+            "fields": {
+                "open": float(ts_data["1. open"]),
+                "high": float(ts_data["2. high"]),
+                "low": float(ts_data["3. low"]),
+                "close": float(ts_data["4. close"]),
+                "volume": int(ts_data["5. volume"]),
+            },
+        }
 
     def write_to_influxdb(self, data: dict) -> None:
         """
@@ -201,10 +206,11 @@ class FinancialDataLoader:
             self.write_api.write(
                 bucket=self.bucket, org=self.org, record=formatted_data
             )
+            logger.info("Data written to InfluxDB: %s", data["Meta Data"]["2. Symbol"])
         except ApiException as e:
             logger.exception(f"Error while writing to InfluxDB: {e}")
 
-    def send_messages(self, messages):
+    def send_messages(self, messages:dict):
         """
         Send a batch of messages in a single request to an SQS queue.
         This request may return overall success even when some messages were not sent.
@@ -217,7 +223,7 @@ class FinancialDataLoader:
                 messages.
         """
         try:
-            sqs_client = boto3.client("sqs")
+            sqs_client = self.sqs_client
             entries = [
                 {
                     "Id": str(ind),
@@ -263,3 +269,4 @@ class FinancialDataLoader:
 
             # Wait for the function to complete
             concurrent.futures.wait([future])
+
