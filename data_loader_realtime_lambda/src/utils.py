@@ -18,7 +18,7 @@ Usage:
     1. Create an instance of ConnectionInitializer to initialize AWS and InfluxDB connections.
     2. Create an instance of FinancialDataLoader, providing initialized SQS and InfluxDB clients.
     3. Use the methods of FinancialDataLoader to fetch data from Alpha Vantage API, send messages to SQS,
-       and store data in InfluxDB.
+    and store data in InfluxDB.
 
 Example:
     # Initialize SQS and InfluxDB clients
@@ -35,8 +35,11 @@ Example:
 # FIXME:
 
 # Import Dependencies
-import json
 import os
+import sys
+import json
+
+sys.path.append("data_loader_realtime_lambda/")
 
 import boto3
 import requests
@@ -44,6 +47,7 @@ import influxdb_client
 import concurrent.futures
 from botocore.exceptions import ClientError
 from influxdb_client.rest import ApiException
+from influxdb_client.client.write_api import SYNCHRONOUS
 
 from src.logger import create_logger
 
@@ -97,7 +101,7 @@ class ConnectionInitializer:
         Returns:
             influxdb_client.client.write_api.WriteApi: Initialized InfluxDB client.
         """
-        logger.info("Initializing InfluxDB client with URL: %s, %s, %s, %s", self.influxdb_url, self.influxdb_bucket, self.influxdb_org, self.influxdb_token)
+        logger.info("Initializing InfluxDB client with URL: %s, %s, %s", self.influxdb_url, self.influxdb_bucket, self.influxdb_org)
         return influxdb_client.InfluxDBClient(
             url=self.influxdb_url, token=self.influxdb_token, org=self.influxdb_org
         )
@@ -117,7 +121,7 @@ class FinancialDataLoader:
         influxdb_client (influxdb_client.client.write_api.WriteApi): Initialized InfluxDB client.
     """
 
-    def __init__(self):
+    def __init__(self, sqs_client, influxdb_client):
         """
         Initializes the FinancialDataLoader with necessary attributes and clients.
 
@@ -131,8 +135,10 @@ class FinancialDataLoader:
         self.interval = os.getenv("interval")  # Fetch interval from environment variables
         self.apikey = os.getenv("apikey")  # Fetch API key from environment variables
         self.queue_url = os.getenv("queue_url") # Fetch queue url (sqs) from environment variables
-        self.sqs_client = sqs_client  # Assign initialized SQS client
+        self.sqs_client = sqs_client    # Assign initialized SQS client
         self.influxdb_client = influxdb_client  # Assign initialized InfluxDB client
+        self.influxdb_org = os.getenv("influxdb_org") # Fetch influxDB org name
+        self.influxdb_bucket = os.getenv("influxdb_bucket") # Fetch influxDB bucket name
 
         logger.info(
             "API INFO: %s, %s, %s, %s",
@@ -153,11 +159,7 @@ class FinancialDataLoader:
         url = f"{self.url}?function={self.function}&symbol={self.symbol}&interval={self.interval}&apikey={self.apikey}"
         logger.info(f"URL: {url}")
         try:
-            payload = {}
-            headers = {}
-            response = requests.request("GET", url=url, headers=headers, data=payload)
-            response.raise_for_status()  # Raise an HTTPError for bad responses
-            return response._content
+            return self.ApiCall(url)
         except requests.exceptions.HTTPError as errh:
             logger.exception(f"HTTP Error: {errh}")
         except requests.exceptions.ConnectionError as errc:
@@ -167,7 +169,23 @@ class FinancialDataLoader:
         except requests.exceptions.RequestException as err:
             logger.exception(f"Request Exception: {err}")
 
-    def prepare_data(self, data: dict) -> list:
+    def ApiCall(self, url: str)->dict:
+        """
+        Makes an API call to the Alpha Vantage API.
+
+        Args:
+            url (str): URL for Alpha Vantage API to get stock data.
+
+        Returns:
+            dict: Response object containing data from the API.
+        """
+        response = requests.request("GET", url=url)
+        response.raise_for_status()  # Raise an HTTPError for bad responses
+        logger.info(f"API Response: {response.status_code}")
+        return response.json()
+
+    @staticmethod
+    def prepare_data(data: dict) -> dict:
         """
         Prepares data in dictionary format for insertion into InfluxDB.
 
@@ -177,10 +195,10 @@ class FinancialDataLoader:
         Returns:
             list: List of dictionaries containing formatted data for InfluxDB insertion.
         """
-        data = json.loads(data)
         time_series_data = data.get("Time Series (5min)")
         latest_refreshed = data["Meta Data"]["3. Last Refreshed"]
         ts_data = time_series_data[latest_refreshed]
+        logger.info(f"lastest data: {ts_data}")
         return {
             "measurement": "stock_prices",
             "tags": {"symbol": data["Meta Data"]["2. Symbol"]},
@@ -194,7 +212,7 @@ class FinancialDataLoader:
             },
         }
 
-    def write_to_influxdb(self, data: dict) -> None:
+    def write_to_influxdb(self, data: dict) -> bool:
         """
         Writes formatted data to InfluxDB.
 
@@ -202,13 +220,14 @@ class FinancialDataLoader:
             data (dict): Raw financial data in dictionary format.
         """
         try:
-            formatted_data = self.prepare_data(data)
-            self.write_api.write(
-                bucket=self.bucket, org=self.org, record=formatted_data
-            )
-            logger.info("Data written to InfluxDB: %s", data["Meta Data"]["2. Symbol"])
+            write_api = self.influxdb_client.write_api(write_options=SYNCHRONOUS)
+            record = influxdb_client.Point(data["measurement"]).tag("stock",data["tags"]["symbol"]).time(data["time"]).field("open", data["fields"]["open"])
+            write_api.write(bucket=self.influxdb_bucket, org=self.influxdb_org, record=record)
+            logger.info("Data written to InfluxDB.")
+            return True
         except ApiException as e:
             logger.exception(f"Error while writing to InfluxDB: {e}")
+            return False
 
     def send_messages(self, messages:dict):
         """
@@ -238,35 +257,48 @@ class FinancialDataLoader:
             if "Successful" in response:
                 for msg_meta in response["Successful"]:
                     logger.info("Message sent: %s", msg_meta["MessageId"])
+                    return True
             if "Failed" in response:
                 for msg_meta in response["Failed"]:
                     logger.warning("Failed to send: %s", msg_meta["MessageId"])
+                    return False
         except ClientError as error:
             logger.exception("Send messages failed to queue: %s", self.queue_url)
             raise error
         else:
-            return response
+            return False
 
-    def process_and_send_data_concurrently(self, data: dict) -> None:
-        """
-        Prepare and send data to InfluxDB and SQS concurrently.
+    # def process_and_send_data_concurrently(self, data: dict) -> dict:
+    #     """
+    #     Prepare and send data to InfluxDB and SQS concurrently.
 
-        Args:
-            data (dict): Raw financial data in dictionary format.
-        """
-        def process_data():
-            """
-            Prepare data for InfluxDB and SQS and send it concurrently.
-            """
-            formatted_data = self.prepare_data(data)
-            self.write_to_influxdb(formatted_data)
-            self.send_messages(self.queue_url, formatted_data)
+    #     Args:
+    #         data (dict): Raw financial data in dictionary format.
 
-        # Use ThreadPoolExecutor to run functions concurrently
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            # Submit the function to executor
-            future = executor.submit(process_data)
+    #     Returns:
+    #         dict: A dictionary indicating the success status of InfluxDB and SQS write actions.
+    #             Example: {"influxdb": True, "sqs": True}
+    #     """
+    #     results = {"influxdb": False, "sqs": False}
 
-            # Wait for the function to complete
-            concurrent.futures.wait([future])
+    #     def process_data():
+    #         """
+    #         Prepare data for InfluxDB and SQS and send it concurrently.
+    #         """
+    #         formatted_data = self.prepare_data(data)
+    #         influxdb_success = self.write_to_influxdb(formatted_data)
+    #         sqs_success = self.send_messages(self.queue_url, formatted_data)
+    #         results["influxdb"] = influxdb_success
+    #         results["sqs"] = sqs_success
+
+    #     # Use ThreadPoolExecutor to run functions concurrently
+    #     with concurrent.futures.ThreadPoolExecutor() as executor:
+    #         # Submit the function to executor
+    #         logger.info("Running executor process")
+    #         future = executor.submit(process_data)
+
+    #         # Wait for the function to complete
+    #         concurrent.futures.wait([future])
+
+    #     return results
 
