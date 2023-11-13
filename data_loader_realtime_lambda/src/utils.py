@@ -267,38 +267,3 @@ class FinancialDataLoader:
             raise error
         else:
             return False
-
-    # def process_and_send_data_concurrently(self, data: dict) -> dict:
-    #     """
-    #     Prepare and send data to InfluxDB and SQS concurrently.
-
-    #     Args:
-    #         data (dict): Raw financial data in dictionary format.
-
-    #     Returns:
-    #         dict: A dictionary indicating the success status of InfluxDB and SQS write actions.
-    #             Example: {"influxdb": True, "sqs": True}
-    #     """
-    #     results = {"influxdb": False, "sqs": False}
-
-    #     def process_data():
-    #         """
-    #         Prepare data for InfluxDB and SQS and send it concurrently.
-    #         """
-    #         formatted_data = self.prepare_data(data)
-    #         influxdb_success = self.write_to_influxdb(formatted_data)
-    #         sqs_success = self.send_messages(self.queue_url, formatted_data)
-    #         results["influxdb"] = influxdb_success
-    #         results["sqs"] = sqs_success
-
-    #     # Use ThreadPoolExecutor to run functions concurrently
-    #     with concurrent.futures.ThreadPoolExecutor() as executor:
-    #         # Submit the function to executor
-    #         logger.info("Running executor process")
-    #         future = executor.submit(process_data)
-
-    #         # Wait for the function to complete
-    #         concurrent.futures.wait([future])
-
-    #     return results
-
